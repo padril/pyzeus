@@ -1,6 +1,7 @@
 # Copyright 2024 Leo (padril) Peckham
 
-from typing import Tuple, List, Union, Optional, Set
+from __future__ import annotations
+from typing import Tuple, List, Union, Optional, Set, Callable
 from subprocess import Popen, PIPE
 from fcntl import fcntl, F_GETFL, F_SETFL
 from os import O_NONBLOCK
@@ -27,9 +28,119 @@ class Ident:
 
 Token = Value | Operator | Ident
 
+CombData = Optional[Tuple[str, List[str]]]
+CombFn = Callable[[CombData], CombData]
+
+class Combinator:
+    fn: CombFn
+    def __init__(self, fn: CombFn):
+        self.fn = fn
+
+    def __call__(self, cd: CombData) -> CombData:
+        return self.fn(cd)
+
+    def then(self, other: Combinator) -> Combinator:
+        def then_fn(cd: CombData) -> CombData:
+            return other(self(cd))
+        return Combinator(then_fn)
+    
+    def then_cat(self, other: Combinator) -> Combinator:
+        def then_cat_fn(cd: CombData) -> CombData:
+            cd = other(self(cd))
+            if not cd: return None
+            return (cd[0], cd[1][0:-2] + [cd[1][-2] + cd[1][-1]])
+        return Combinator(then_cat_fn)
+
+    def then_opt(self, other: Combinator) -> Combinator:
+        return self.then(other).alt(self)
+
+    def then_opt_cat(self, other: Combinator) -> Combinator:
+        return self.then_cat(other).alt(self)
+        
+    def alt(self, other: Combinator) -> Combinator:
+        def alt_fn(cd: CombData) -> CombData:
+            res = self(cd)
+            if res:
+                return res
+            else:
+                return other(cd)
+        return Combinator(alt_fn)
+
+    def any_cat(self) -> Combinator:
+        def any_cat_fn(cd: CombData) -> CombData:
+            last = cd
+            cd = self(cd)
+            if not cd: return None
+            while cd and cd[0] != '':
+                last = cd
+                cd = self(cd)
+                if cd and len(cd[1]) >= 2:
+                    cd = (cd[0], cd[1][0:-2] + [cd[1][-2] + cd[1][-1]])
+            return last if not cd else cd
+        return Combinator(any_cat_fn)
+
+    def any(self) -> Combinator:
+        def any_fn(cd: CombData) -> CombData:
+            last = cd
+            cd = self(cd)
+            if not cd: return None
+            while cd and cd[0] != '':
+                last = cd
+                cd = self(cd)
+            return last if not cd else cd
+        return Combinator(any_fn)
+
+    def discard(self) -> Combinator:
+        def discard_fn(cd: CombData) -> CombData:
+            res = self(cd)
+            if res: return (res[0], res[1][0:-1])
+            return None
+        return Combinator(discard_fn)
+
+def cterm(s: str) -> Combinator:
+    def cterm_fn(cd: CombData) -> CombData:
+        if not cd: return None
+        if len(s) > len(cd[0]): return None
+        for i in range(len(s)):
+            if s[i] != cd[0][i]: return None
+        return (cd[0][len(s):], cd[1] + [s])
+    return Combinator(cterm_fn)
+
+def cset(ss: List[str]) -> Combinator:
+    def cset_fn(cd: CombData) -> CombData:
+        for s in ss:
+            res = cterm(s)(cd)
+            if res: return res
+        return None
+    return Combinator(cset_fn)
+
+def cdigit() -> Combinator:
+    return cset(list(map(str, range(0, 10))))
+
+def cwhite() -> Combinator:
+    return cset([' ', '\t', '\n'])
+
+def calpha() -> Combinator:
+    return cset(list('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'))
+
+def calphanum() -> Combinator:
+    return cdigit().alt(calpha())
+
+def lex(s: str) -> List[str]:
+    res = (
+            cdigit().any_cat()                  # Integers
+            .then_opt_cat(cterm('.').then_cat(cdigit().any_cat()))  # & Float
+            .alt(cwhite().any_cat().discard())  # Whitespace
+            .alt(cset(['+', '-', '*', '/', '=']))    # Operators
+            .alt(calpha().then_opt_cat(calphanum().alt(cterm('_').any_cat())))
+            .any()
+           )((s, []))
+    if res: return res[1]
+    else: return []
+
 def tokenize(command: str) -> List[Token]:
     tokens: List[Token] = []
-    lexemes: List[str] = command.split()
+    lexemes: List[str] = lex(command)
     for lexeme in lexemes:
         token: Optional[Token] = None
         if lexeme == '': continue
@@ -39,7 +150,6 @@ def tokenize(command: str) -> List[Token]:
         elif lexeme == '=': token = Operator('=')
         if token: tokens.append(token)
     return tokens
-
 
 class OpExpr:
     op: Operator
