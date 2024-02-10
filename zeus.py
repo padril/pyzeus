@@ -1,38 +1,11 @@
 # Copyright 2024 Leo (padril) Peckham
 
 from __future__ import annotations
-from typing import Tuple, List, Union, Optional, Set, Callable, TypeVar
+from typing import Tuple, List, Union, Optional, Set, Callable, TypeVar, Any
 from subprocess import Popen, PIPE
 from fcntl import fcntl, F_GETFL, F_SETFL
 from os import O_NONBLOCK
 from time import sleep
-
-class Value:
-    value: Union[int, str, float]
-    def __init__(self, value: Union[int, str, float]):
-        self.value = value
-    def __repr__(self) -> str:
-        return f'Value: {self.value}'
-    def __add__(self, other: Token) -> List[Token]:
-        return [self, other]
-
-class Operator:
-    value: str
-    def __init__(self, value: str):
-        self.value = value
-    def __repr__(self) -> str:
-        return f'Operator: {self.value}'
-    def __add__(self, other: Token) -> List[Token]:
-        return [self, other]
-
-class Ident:
-    value: str
-    def __init__(self, value: str):
-        self.value = value
-    def __add__(self, other: Token) -> List[Token]:
-        return [self, other]
-
-Token = Value | Operator | Ident
 
 InBase = TypeVar('InBase')
 OutBase = TypeVar('OutBase')
@@ -111,83 +84,97 @@ class Combinator:
             return None
         return Combinator(discard_fn)
 
-def cstr(s: str) -> Combinator:
+    def convert(self, fn: Callable[[OutType], OutBase]) -> Combinator:
+        def convert_fn(cd: CombData) -> CombData:
+            res = self(cd)
+            if not res: return None
+            return (res[0], res[1][0:-1] + [fn(res[1][-1])])
+        return Combinator(convert_fn)
+
+
+def cterm[T](xs: List[T]) -> Combinator:
     def cterm_fn(cd: CombData) -> CombData:
         if not cd: return None
-        if len(s) > len(cd[0]): return None
-        for i in range(len(s)):
-            if s[i] != cd[0][i]: return None
-        return (cd[0][len(s):], cd[1] + [s])
+        if len(xs) > len(cd[0]): return None
+        for i in range(len(xs)):
+            if xs[i] != cd[0][i]: return None
+        return (cd[0][len(xs):], cd[1] + [xs])
     return Combinator(cterm_fn)
 
-def cset(xs: InType) -> Combinator:
+def cstr(s: str) -> Combinator:
+    return cterm(list(s))
+
+def cset[T](xs: List[List[T]]) -> Combinator:
     def cset_fn(cd: CombData) -> CombData:
         for x in xs:
-            res = cstr(x)(cd)
+            res = cterm(x)(cd)
             if res: return res
         return None
     return Combinator(cset_fn)
 
 def cdigit() -> Combinator:
-    return cset(list(map(str, range(0, 10))))
+    return cset(list(map(lambda x: list(str(x)), range(0, 10))))
 
 def cwhite() -> Combinator:
-    return cset([' ', '\t', '\n'])
+    return cset([[' '], ['\t'], ['\n']])
 
 def calpha() -> Combinator:
-    return cset(list('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'))
+    return cset(list(map(
+        lambda x: [str(x)],
+        'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ')))
 
 def calphanum() -> Combinator:
     return cdigit().alt(calpha())
 
-def lex(s: str) -> List[str]:
-    res = (
-            cdigit().any_cat()                  # Integers
-            .then_opt_cat(cstr('.').then_cat(cdigit().any_cat()))  # & Float
+class Token[ValueType]:
+    t: str
+    v: ValueType
+    def __init__(self, t: str, v: ValueType):
+        self.t = t
+        self.v = v
+    def __repr__(self):
+        return f'{self.t}: {self.v}' if self.v else f'{self.t}'
+
+def tokenize(s: str) -> List[Token]:
+    res: Optional[Tuple[List[str], List[List[Token]]]] = (
+            # Integers
+            cdigit().any_cat().then_cat(cstr('.').then_cat(cdigit().any_cat()))
+            .convert(lambda xs: Token('val', float(''.join([str(x) for x in xs]))))
+            .alt(cdigit().any_cat().convert(
+                lambda xs: Token('val', int(''.join([str(x) for x in xs])))))
             .alt(cwhite().any_cat().discard())  # Whitespace
-            .alt(cset(['+', '-', '*', '/', '=']))    # Operators
-            .alt(calpha().then_opt_cat(calphanum().alt(cstr('_').any_cat())))
+            .alt(cset([['+'], ['-'], ['*'], ['/'], ['=']])
+                 .convert(lambda xs: Token('op', ''.join([str(x) for x in xs]))))    # Operators
+            .alt(calpha().then_opt_cat(calphanum().alt(cstr('_')).any_cat())
+                 .convert(lambda xs: Token('ident', ''.join([str(x) for x in xs]))))
             .any()
-           )((list(s), []))
+            )((list(s), []))
     if res:
-        return list(
-                map(lambda xs: ''.join(xs) if isinstance(xs, List) else xs,
-                   res[1]))
-    return []
-
-
-def isfloat(s) -> bool:
-    res = s.split('.')
-    return len(res) == 2 and res[0].isdigit() and res[1].isdigit()
-
-def tokenize(command: str) -> List[Token]:
-    tokens: List[Token] = []
-    lexemes: List[str] = lex(command)
-    for lexeme in lexemes:
-        token: Optional[Token] = None
-        if lexeme == '': continue
-        elif lexeme.isdigit(): token = Value(int(lexeme))
-        elif isfloat(lexeme): token = Value(float(lexeme))
-        elif lexeme.isidentifier(): token = Ident(lexeme)
-        elif lexeme in {'+', '-', '*', '/'}: token = Operator(lexeme)
-        elif lexeme == '=': token = Operator('=')
-        if token: tokens.append(token)
-    return tokens
+        llt: List[List[Token]] = res[1]
+        flattened = []
+        for item in llt:
+            if isinstance(item, list):
+                flattened.extend(item)
+            else:
+                flattened.append(item)
+        return flattened
+    else:
+        return []
 
 # TODO: This whole AST thing should be done with an AST combinator
 
 class OpExpr:
-    op: Operator
+    op: Token
     x: Expr
     y: Expr
-    def __init__(self, op: Operator, x: Expr, y: Expr):
+    def __init__(self, op: Token, x: Expr, y: Expr):
         self.op = op
         self.x = x
         self.y = y
 
 class ArgList:
-    args: List[Ident]
-    def __init__(self, args: List[Ident]):
+    args: List[Token]
+    def __init__(self, args: List[Token]):
         self.args = args
 
 class FuncExpr:
@@ -197,16 +184,17 @@ class FuncExpr:
         self.args = args
         self.fn = fn
 
-Rvalue = Value | Ident
+Rvalue = Token
 Expr = OpExpr | Rvalue | FuncExpr
 AST = Expr | List['AST']
 
 def parse_expr(tokens: List[Token]) -> Tuple[List[Token], Expr]:
+    print(tokens)
     match tokens:
         case [v] if isinstance(v, Rvalue):
             return ([], v)
-        case [lv, op, *expr] if isinstance(lv, Rvalue) and \
-                isinstance(op, Operator):
+        case [lv, op, *expr] if lv.t in {'ident', 'val'} and \
+                op.t == 'op':
             (rem, rv) = parse_expr(expr)
             return (rem, OpExpr(op, lv, rv))
        # case [*idents, op, *expr] if all(
@@ -232,20 +220,22 @@ def generate_ir(ast: AST, env: Env, ret: int) -> Tuple[IR, Env]:
     ir: IR = []
     local: Env = env
     if isinstance(ast, Expr):
-        if isinstance(ast, Value):
-            return ([('set', f'r{ret}', str(ast.value))], env)
-        elif isinstance(ast, Ident):
-            return ([('set', f'r{ret}', f'$v{ast.value}')], env)
+        if isinstance(ast, Token):
+            if ast.t == 'val':
+                return ([('set', f'r{ret}', str(ast.v))], env)
+            elif ast.t == 'ident':
+                return ([('set', f'r{ret}', f'$v{ast.v}')], env)
         elif isinstance(ast, OpExpr):
-            if ast.op.value == '=' and isinstance(ast.x, Ident):
+            if ast.op.v == '=' and \
+                    isinstance(ast.x, Token) and ast.x.t == 'ident':
                 (rir, renv) = generate_ir(ast.y, env, ret + 1)
-                return (rir + [('set', f'v{ast.x.value}', f'$r{ret+1}'),
+                return (rir + [('set', f'v{ast.x.v}', f'$r{ret+1}'),
                                ('set', f'r{ret}', f'$r{ret+1}')],
-                        (env[0], env[1] | renv[1] | {ast.x.value}))
+                        (env[0], env[1] | renv[1] | {ast.x.v}))
             (lir, lenv) = generate_ir(ast.x, env, ret)
             (rir, renv) = generate_ir(ast.y, env, ret + 1)
             return (lir + rir +\
-                    [(str(ast.op.value), f'r{ret}', f'$r{ret+1}')],
+                    [(str(ast.op.v), f'r{ret}', f'$r{ret+1}')],
                     (env[0], env[1] | lenv[1] | renv[1]))
 
     else:
