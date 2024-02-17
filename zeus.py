@@ -14,6 +14,8 @@ OutType = List[OutBase | List[OutBase]]
 CombData = Optional[Tuple[InType, OutType]]
 CombFn = Callable[[CombData], CombData]
 
+# This is some criminally undercommented shit,,, this will bite me in
+# the ass later, but I don't really care right now.
 class Combinator:
     fn: CombFn
     def __init__(self, fn: CombFn):
@@ -41,7 +43,17 @@ class Combinator:
 
     def then_opt_cat(self, other: Combinator) -> Combinator:
         return self.then_cat(other).alt(self)
-        
+
+    def cat(self) -> Combinator:
+        def cat_fn(cd: CombData) -> CombData:
+            cd = self(cd)
+            if cd and len(cd[1]) >= 2:
+                lcomb = cd[1][-2] if isinstance(cd[1][-2], List) else [cd[1][-2]]
+                rcomb = cd[1][-1] if isinstance(cd[1][-1], List) else [cd[1][-1]]
+                cd = (cd[0], cd[1][0:-2] + [lcomb + rcomb])
+            return cd
+        return Combinator(cat_fn)
+
     def alt(self, other: Combinator) -> Combinator:
         def alt_fn(cd: CombData) -> CombData:
             res = self(cd)
@@ -88,9 +100,41 @@ class Combinator:
         def convert_fn(cd: CombData) -> CombData:
             res = self(cd)
             if not res: return None
-            return (res[0], res[1][0:-1] + [fn(res[1][-1])])
+            appl = fn(res[1][-1])
+            if not appl: return None
+            return (res[0], res[1][0:-1] + [appl])
         return Combinator(convert_fn)
 
+    def cond(self, fn: Callable[[OutType], bool]) -> Combinator:
+        return self.convert(lambda x: x if fn(x) else None)
+
+    def box(self) -> Combinator:
+        return self.convert(lambda x: [x])
+
+    def apply(self, fn: Callable[[], Combinator]) -> Combinator:
+        def apply_fn(cd: CombData) -> CombData:
+            if self(cd):
+                ret = fn()(self(cd))
+                return ret
+            return None
+        return Combinator(apply_fn)
+
+    def recurse_or(self, other: Combinator) -> Combinator:
+        def recurse_or_fn(cd: CombData) -> CombData:
+            res = self(cd)
+            return recurse_or_fn(res) if res else other(cd)
+        return Combinator(recurse_or_fn)
+
+    def recurse_or_cat(self, other: Combinator) -> Combinator:
+        def recurse_or_cat_fn(cd: CombData) -> CombData:
+            res = self.cat()(cd)
+            return recurse_or_cat_fn(res) if res else other.cat()(cd)
+        return Combinator(recurse_or_cat_fn)
+
+def cid() -> Combinator:
+    def cid_fn(cd: CombData) -> CombData:
+        return cd
+    return Combinator(cid_fn)
 
 def cterm[T](xs: List[T]) -> Combinator:
     def cterm_fn(cd: CombData) -> CombData:
@@ -100,6 +144,15 @@ def cterm[T](xs: List[T]) -> Combinator:
             if xs[i] != cd[0][i]: return None
         return (cd[0][len(xs):], cd[1] + [xs])
     return Combinator(cterm_fn)
+
+def ctype(xs: List[str]) -> Combinator:
+    def ctype_fn(cd: CombData) -> CombData:
+        if not cd: return None
+        if not cd[0]: return None
+        if cd[0][0].t in xs:
+            return (cd[0][1:], cd[1] + [cd[0][0]])
+        else: return None
+    return Combinator(ctype_fn)
 
 def cstr(s: str) -> Combinator:
     return cterm(list(s))
@@ -161,56 +214,43 @@ def tokenize(s: str) -> List[Token]:
     else:
         return []
 
-# TODO: This whole AST thing should be done with an AST combinator
+OP_PREC = {
+        '+' : 100,
+        '*' : 200,
+        }
 
-class OpExpr:
-    op: Token
-    x: Expr
-    y: Expr
-    def __init__(self, op: Token, x: Expr, y: Expr):
-        self.op = op
-        self.x = x
-        self.y = y
+def precedes(x, y) -> bool:
+    if not (isinstance(x, List) and isinstance(y, List)):
+        return True
+    return OP_PREC[x[0].v] < OP_PREC[y[0].v]
 
-class ArgList:
-    args: List[Token]
-    def __init__(self, args: List[Token]):
-        self.args = args
+def parse_opexpr() -> Combinator:
+    return (
+            ctype(['val', 'ident'])
+            .then_cat(ctype(['op']))
+            .apply(parse_opexpr)
+            .convert(lambda xs: [xs[1], xs[0], xs[2]])
+            .cond(lambda xs: precedes(xs, xs[2]))
+            .alt(ctype(['val', 'ident'])
+                 .then_cat(ctype(['op']))
+                 .then_cat(ctype(['val', 'ident']))
+                 .convert(lambda xs: [xs[1], xs[0], xs[2]])
+                 .box()
+                 .then_cat(ctype(['op']))
+                 .apply(parse_opexpr)
+                 .convert(lambda xs: [xs[1], xs[0], xs[2]]))
+            .box()
+            .alt(ctype(['val', 'ident']))
+            .cat())
 
-class FuncExpr:
-    args: ArgList
-    fn: AST
-    def __init__(self, args: ArgList, fn: AST):
-        self.args = args
-        self.fn = fn
+def parse_expr() -> Combinator:
+    return (cid().apply(parse_opexpr))
 
-Rvalue = Token
-Expr = OpExpr | Rvalue | FuncExpr
-AST = Expr | List['AST']
-
-def parse_expr(tokens: List[Token]) -> Tuple[List[Token], Expr]:
-    print(tokens)
-    match tokens:
-        case [v] if isinstance(v, Rvalue):
-            return ([], v)
-        case [lv, op, *expr] if lv.t in {'ident', 'val'} and \
-                op.t == 'op':
-            (rem, rv) = parse_expr(expr)
-            return (rem, OpExpr(op, lv, rv))
-       # case [*idents, op, *expr] if all(
-       #         map(lambda i: isinstance(i, Ident), idents)) and \
-       #         op.value == '->':
-       #     (rem, fn) = parse_expr(expr)
-       #     return (rem, FuncExpr(idents, fn))
-
-    raise Exception('Parse error')
+AST = Token | List['AST']
 
 def parse(tokens: List[Token]) -> AST:
-    ast: AST = []
-    while tokens:
-        (tokens, expr) = parse_expr(tokens)
-        ast.append(expr)
-    return ast
+    res = parse_expr().any()((tokens, []))
+    return res[1] if res else []
 
 Env = Tuple[Optional['Env'], Set[str]]
 
@@ -219,24 +259,26 @@ IR = List[str | Tuple[str,...]]
 def generate_ir(ast: AST, env: Env, ret: int) -> Tuple[IR, Env]:
     ir: IR = []
     local: Env = env
-    if isinstance(ast, Expr):
-        if isinstance(ast, Token):
-            if ast.t == 'val':
-                return ([('set', f'r{ret}', str(ast.v))], env)
-            elif ast.t == 'ident':
-                return ([('set', f'r{ret}', f'$v{ast.v}')], env)
-        elif isinstance(ast, OpExpr):
-            if ast.op.v == '=' and \
-                    isinstance(ast.x, Token) and ast.x.t == 'ident':
-                (rir, renv) = generate_ir(ast.y, env, ret + 1)
-                return (rir + [('set', f'v{ast.x.v}', f'$r{ret+1}'),
-                               ('set', f'r{ret}', f'$r{ret+1}')],
-                        (env[0], env[1] | renv[1] | {ast.x.v}))
-            (lir, lenv) = generate_ir(ast.x, env, ret)
-            (rir, renv) = generate_ir(ast.y, env, ret + 1)
-            return (lir + rir +\
-                    [(str(ast.op.v), f'r{ret}', f'$r{ret+1}')],
-                    (env[0], env[1] | lenv[1] | renv[1]))
+    if isinstance(ast, Token):
+        if ast.t == 'val':
+            return ([('set', f'r{ret}', str(ast.v))], env)
+        elif ast.t == 'ident':
+            return ([('set', f'r{ret}', f'$v{ast.v}')], env)
+    elif isinstance(ast[0], Token) and ast[0].t == 'op':
+        if ast[0].v == '=':
+            if isinstance(ast[1], List):
+                raise Exception('Parse Err: cannot assign value to expression')
+            if ast[1].t != 'ident':
+                raise Exception('Parse Err: cannot assign to rvalue')
+            (rir, renv) = generate_ir(ast[2], env, ret + 1)
+            return (rir + [('set', f'v{ast[1].v}', f'$r{ret+1}'),
+                           ('set', f'r{ret}', f'$r{ret+1}')],
+                    (env[0], env[1] | renv[1] | {ast[1].v}))
+        (lir, lenv) = generate_ir(ast[1], env, ret)
+        (rir, renv) = generate_ir(ast[2], env, ret + 1)
+        return (lir + rir +\
+                [(str(ast[0].v), f'r{ret}', f'$r{ret+1}')],
+                (env[0], env[1] | lenv[1] | renv[1]))
 
     else:
         for node in ast:
