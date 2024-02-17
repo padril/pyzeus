@@ -16,6 +16,9 @@ CombFn = Callable[[CombData], CombData]
 
 # This is some criminally undercommented shit,,, this will bite me in
 # the ass later, but I don't really care right now.
+
+# TODO: The consistency with boxing is fucking stupid here, change that shit
+
 class Combinator:
     fn: CombFn
     def __init__(self, fn: CombFn):
@@ -187,6 +190,8 @@ class Token[ValueType]:
         self.v = v
     def __repr__(self):
         return f'{self.t}: {self.v}' if self.v else f'{self.t}'
+    def __eq__(self, other):
+        return self.t == other.t and self.v == other.v
 
 def tokenize(s: str) -> List[Token]:
     res: Optional[Tuple[List[str], List[List[Token]]]] = (
@@ -196,7 +201,8 @@ def tokenize(s: str) -> List[Token]:
             .alt(cdigit().any_cat().convert(
                 lambda xs: Token('val', int(''.join([str(x) for x in xs])))))
             .alt(cwhite().any_cat().discard())  # Whitespace
-            .alt(cset([['+'], ['-'], ['*'], ['/'], ['=']])
+            .alt(cset(list(map(list, sorted(['+', '-', '*', '/', '=', '->'],
+                                            key=len, reverse=True))))
                  .convert(lambda xs: Token('op', ''.join([str(x) for x in xs]))))    # Operators
             .alt(calpha().then_opt_cat(calphanum().alt(cstr('_')).any_cat())
                  .convert(lambda xs: Token('ident', ''.join([str(x) for x in xs]))))
@@ -215,6 +221,7 @@ def tokenize(s: str) -> List[Token]:
         return []
 
 OP_PREC = {
+        '=' :  50,
         '+' : 100,
         '*' : 200,
         }
@@ -222,39 +229,66 @@ OP_PREC = {
 def precedes(x, y) -> bool:
     if not (isinstance(x, List) and isinstance(y, List)):
         return True
+    if x[0].v not in OP_PREC:
+        return False
+    if y[0].v not in OP_PREC:
+        return True
     return OP_PREC[x[0].v] < OP_PREC[y[0].v]
+
+def pol_order(xs: List) -> List:
+    return [xs[1], xs[0], xs[2]]
 
 def parse_opexpr() -> Combinator:
     return (
             ctype(['val', 'ident'])
             .then_cat(ctype(['op']))
-            .apply(parse_opexpr)
-            .convert(lambda xs: [xs[1], xs[0], xs[2]])
+            .apply(parse_expr)
+            .convert(pol_order)
             .cond(lambda xs: precedes(xs, xs[2]))
             .alt(ctype(['val', 'ident'])
                  .then_cat(ctype(['op']))
                  .then_cat(ctype(['val', 'ident']))
-                 .convert(lambda xs: [xs[1], xs[0], xs[2]])
+                 .convert(pol_order)
                  .box()
                  .then_cat(ctype(['op']))
-                 .apply(parse_opexpr)
-                 .convert(lambda xs: [xs[1], xs[0], xs[2]]))
+                 .apply(parse_expr)
+                 .convert(pol_order))
             .box()
             .alt(ctype(['val', 'ident']))
             .cat())
 
+def parse_fnexpr() -> Combinator:
+    return (
+            ctype(['ident']).box().any_cat().box()
+            .then_cat(cterm([Token('op', '->')]))
+            .apply(parse_expr)
+            .convert(pol_order)
+            .box()
+            .cat())
+
+def parse_callexpr() -> Combinator:
+    return (
+            ctype(['ident'])
+            .then_cat(ctype(['ident', 'val']).box().any_cat().box())
+            .convert(lambda xs: [Token('call', None), *xs]))
+
 def parse_expr() -> Combinator:
-    return (cid().apply(parse_opexpr))
+    return (parse_fnexpr()
+            .alt(parse_callexpr())
+            .alt(parse_opexpr()))
 
 AST = Token | List['AST']
 
 def parse(tokens: List[Token]) -> AST:
     res = parse_expr().any()((tokens, []))
+    # print(f'AST: {res[1]}\nRem: {res[0]}' if res else 'Parse error')
     return res[1] if res else []
 
 Env = Tuple[Optional['Env'], Set[str]]
 
 IR = List[str | Tuple[str,...]]
+
+FUNCTION_COUNTER = 0
 
 def generate_ir(ast: AST, env: Env, ret: int) -> Tuple[IR, Env]:
     ir: IR = []
@@ -264,6 +298,13 @@ def generate_ir(ast: AST, env: Env, ret: int) -> Tuple[IR, Env]:
             return ([('set', f'r{ret}', str(ast.v))], env)
         elif ast.t == 'ident':
             return ([('set', f'r{ret}', f'$v{ast.v}')], env)
+    elif isinstance(ast[0], Token) and ast[0].t == 'call':
+        assert(isinstance(ast[1], Token))
+        assert(isinstance(ast[2], List))
+        args = [(f'v{x.v}' if x.t == 'ident' else str(x.v))
+                for x in ast[2] if isinstance(x, Token)]
+        return ([('call', ast[1].v, ' '.join(args), f'r{ret}')],
+                env)
     elif isinstance(ast[0], Token) and ast[0].t == 'op':
         if ast[0].v == '=':
             if isinstance(ast[1], List):
@@ -274,6 +315,28 @@ def generate_ir(ast: AST, env: Env, ret: int) -> Tuple[IR, Env]:
             return (rir + [('set', f'v{ast[1].v}', f'$r{ret+1}'),
                            ('set', f'r{ret}', f'$r{ret+1}')],
                     (env[0], env[1] | renv[1] | {ast[1].v}))
+        elif ast[0].v == '->':
+            assert(isinstance(ast[1], List))
+            idents = [ident.v for ident in ast[1] if isinstance(ident, Token)]
+            (rir, _) = generate_ir(ast[2], (env, set(idents)), 0)
+            global FUNCTION_COUNTER
+            FUNCTION_COUNTER += 1
+            def replace_vs(x: str) -> str:
+                if len(x) < 2: return x
+                if x[0] == '$':
+                    if x[1] == 'v':
+                        if x[2:] not in idents: return x
+                        return f'$a{idents.index(x[2:]) + 1}'
+                elif x[0] == 'v':
+                    if x[1:] not in idents: return x
+                    return f'a{idents.index(x[1:]) + 1}'
+                return x
+            return ([('label', f'f{FUNCTION_COUNTER}', str(len(idents)))] + \
+                    list(map(
+                        lambda xs: tuple(map(replace_vs, xs)),
+                        rir)) + \
+                    [('endlabel',), ('set', f'r{ret}', f'f{FUNCTION_COUNTER}')],
+                    env)
         (lir, lenv) = generate_ir(ast[1], env, ret)
         (rir, renv) = generate_ir(ast[2], env, ret + 1)
         return (lir + rir +\
@@ -290,14 +353,27 @@ def generate_ir(ast: AST, env: Env, ret: int) -> Tuple[IR, Env]:
 
 def generate_bash(ir: IR) -> str:
     bash: str = ''
+    prefix = ''
     for i in ir:
         match i[0]:
             case 'set':
-                bash += f'{i[1]}={i[2]}\n'
+                bash += f'{prefix}{i[1]}={i[2]}\n'
             case '+' | '-' | '*' | '/':
                 # TODO: Implement `bc -l` for floating point values using
                 # a more advanced ast mechanism/dictionary (divf vs divi etc)
-                bash += f'{i[1]}=$(bc <<< "${i[1]} {i[0]} {i[2]}")\n'
+                bash += f'{prefix}{i[1]}=$(bc <<< "${i[1]} {i[0]} {i[2]}")\n'
+            case 'label':
+                bash += f'{prefix}{i[1]} () {{\n'
+                prefix += '    '
+                for ident in range(1,int(i[2]) + 1):
+                    bash += f'{prefix}a{ident}=${ident}\n'
+            case 'endlabel':
+                bash += f'{prefix}echo $r0\n'
+                prefix = prefix[:-4]
+                bash += '}\n'
+            case 'call':
+                bash += f'{i[3]}="$($v{i[1]} {i[2]})"\n'
+
     bash += 'echo $r0\n\0'
     return bash
 
@@ -311,6 +387,7 @@ def zeusc(command: str, env: Env) -> Tuple[str, Env]:
 
 def zeus(command: str, env: Env, process) -> Tuple[str, str, Env]:
     (bash, env) = zeusc(command, env)
+    # print(bash)
     # debug # return (bash + str(env), '', 0, env)
     process.stdin.write(bash)
     process.stdin.flush()
