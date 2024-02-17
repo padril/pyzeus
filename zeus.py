@@ -7,10 +7,17 @@ from fcntl import fcntl, F_GETFL, F_SETFL
 from os import O_NONBLOCK
 from time import sleep
 
+SHOW_OPTIONS = {
+        'ast': False,
+        'tokens': False,
+        'ir': False,
+        'sh': False,
+        }
+
 InBase = TypeVar('InBase')
 OutBase = TypeVar('OutBase')
 InType = List[InBase]
-OutType = List[OutBase | List[OutBase]]
+OutType = List[OutBase]
 CombData = Optional[Tuple[InType, OutType]]
 CombFn = Callable[[CombData], CombData]
 
@@ -33,13 +40,7 @@ class Combinator:
         return Combinator(then_fn)
     
     def then_cat(self, other: Combinator) -> Combinator:
-        def then_cat_fn(cd: CombData) -> CombData:
-            cd = other(self(cd))
-            if not cd: return None
-            lcomb = cd[1][-2] if isinstance(cd[1][-2], List) else [cd[1][-2]]
-            rcomb = cd[1][-1] if isinstance(cd[1][-1], List) else [cd[1][-1]]
-            return (cd[0], cd[1][0:-2] + [lcomb + rcomb])
-        return Combinator(then_cat_fn)
+        return self.then(other).cat()
 
     def then_opt(self, other: Combinator) -> Combinator:
         return self.then(other).alt(self)
@@ -134,6 +135,12 @@ class Combinator:
             return recurse_or_cat_fn(res) if res else other.cat()(cd)
         return Combinator(recurse_or_cat_fn)
 
+    def display(self) -> Combinator:
+        def display_fn(cd: CombData) -> CombData:
+            print(cd)
+            return self(cd)
+        return Combinator(display_fn)
+
 def cid() -> Combinator:
     def cid_fn(cd: CombData) -> CombData:
         return cd
@@ -153,7 +160,7 @@ def ctype(xs: List[str]) -> Combinator:
         if not cd: return None
         if not cd[0]: return None
         if cd[0][0].t in xs:
-            return (cd[0][1:], cd[1] + [cd[0][0]])
+            return (cd[0][1:], cd[1] + [[cd[0][0]]])
         else: return None
     return Combinator(ctype_fn)
 
@@ -193,32 +200,34 @@ class Token[ValueType]:
     def __eq__(self, other):
         return self.t == other.t and self.v == other.v
 
+def stringify(xs: List[str]) -> str:
+    if xs == []: return ''
+    return ''.join(x for x in xs[0])
+
 def tokenize(s: str) -> List[Token]:
     res: Optional[Tuple[List[str], List[List[Token]]]] = (
             # Integers
             cdigit().any_cat().then_cat(cstr('.').then_cat(cdigit().any_cat()))
-            .convert(lambda xs: Token('val', float(''.join([str(x) for x in xs]))))
-            .alt(cdigit().any_cat().convert(
-                lambda xs: Token('val', int(''.join([str(x) for x in xs])))))
+            .box()
+            .convert(stringify)
+            .convert(lambda xs: Token('val', float(str(xs))))
+            .alt(cdigit().any_cat()
+                 .box()
+                 .convert(stringify)
+                 .convert(lambda xs: Token('val', int(str(xs)))))
             .alt(cwhite().any_cat().discard())  # Whitespace
             .alt(cset(list(map(list, sorted(['+', '-', '*', '/', '=', '->'],
                                             key=len, reverse=True))))
-                 .convert(lambda xs: Token('op', ''.join([str(x) for x in xs]))))    # Operators
+                 .box()
+                 .convert(stringify)
+                 .convert(lambda xs: Token('op', str(xs))))    # Operators
             .alt(calpha().then_opt_cat(calphanum().alt(cstr('_')).any_cat())
-                 .convert(lambda xs: Token('ident', ''.join([str(x) for x in xs]))))
+                 .box()
+                 .convert(stringify)
+                 .convert(lambda xs: Token('ident', str(xs))))
             .any()
             )((list(s), []))
-    if res:
-        llt: List[List[Token]] = res[1]
-        flattened = []
-        for item in llt:
-            if isinstance(item, list):
-                flattened.extend(item)
-            else:
-                flattened.append(item)
-        return flattened
-    else:
-        return []
+    return res[1] if res else []
 
 OP_PREC = {
         '=' :  50,
@@ -227,39 +236,39 @@ OP_PREC = {
         }
 
 def precedes(x, y) -> bool:
-    if not (isinstance(x, List) and isinstance(y, List)):
+    if x[0].t != 'op' or y[0].t != 'op':
         return True
     if x[0].v not in OP_PREC:
         return False
     if y[0].v not in OP_PREC:
         return True
-    return OP_PREC[x[0].v] < OP_PREC[y[0].v]
+    return OP_PREC[x[0].v] <= OP_PREC[y[0].v]
 
 def pol_order(xs: List) -> List:
     return [xs[1], xs[0], xs[2]]
 
 def parse_opexpr() -> Combinator:
     return (
-            ctype(['val', 'ident'])
+            ctype(['val', 'ident']).box()
             .then_cat(ctype(['op']))
             .apply(parse_expr)
             .convert(pol_order)
             .cond(lambda xs: precedes(xs, xs[2]))
-            .alt(ctype(['val', 'ident'])
+            .alt(ctype(['val', 'ident']).box()
                  .then_cat(ctype(['op']))
-                 .then_cat(ctype(['val', 'ident']))
+                 .then_cat(ctype(['val', 'ident']).box())
                  .convert(pol_order)
                  .box()
                  .then_cat(ctype(['op']))
                  .apply(parse_expr)
                  .convert(pol_order))
-            .box()
             .alt(ctype(['val', 'ident']))
+            .box()
             .cat())
 
 def parse_fnexpr() -> Combinator:
     return (
-            ctype(['ident']).box().any_cat().box()
+            ctype(['ident']).any_cat().box()
             .then_cat(cterm([Token('op', '->')]))
             .apply(parse_expr)
             .convert(pol_order)
@@ -268,8 +277,8 @@ def parse_fnexpr() -> Combinator:
 
 def parse_callexpr() -> Combinator:
     return (
-            ctype(['ident'])
-            .then_cat(ctype(['ident', 'val']).box().any_cat().box())
+            ctype(['ident']).box()
+            .then_cat(ctype(['ident', 'val']).any_cat().box())
             .convert(lambda xs: [Token('call', None), *xs]))
 
 def parse_expr() -> Combinator:
@@ -281,8 +290,12 @@ AST = Token | List['AST']
 
 def parse(tokens: List[Token]) -> AST:
     res = parse_expr().any()((tokens, []))
-    # print(f'AST: {res[1]}\nRem: {res[0]}' if res else 'Parse error')
-    return res[1] if res else []
+    if not res:
+        return []
+    elif isinstance(res[1], List):
+        return res[1]
+    else:
+        return []
 
 Env = Tuple[Optional['Env'], Set[str]]
 
@@ -299,22 +312,26 @@ def generate_ir(ast: AST, env: Env, ret: int) -> Tuple[IR, Env]:
         elif ast.t == 'ident':
             return ([('set', f'r{ret}', f'$v{ast.v}')], env)
     elif isinstance(ast[0], Token) and ast[0].t == 'call':
-        assert(isinstance(ast[1], Token))
+        assert(isinstance(ast[1], List))
+        assert(isinstance(ast[1][0], Token))
         assert(isinstance(ast[2], List))
         args = [(f'v{x.v}' if x.t == 'ident' else str(x.v))
                 for x in ast[2] if isinstance(x, Token)]
-        return ([('call', ast[1].v, ' '.join(args), f'r{ret}')],
+        return ([('call', ast[1][0].v, ' '.join(args), f'r{ret}')],
                 env)
     elif isinstance(ast[0], Token) and ast[0].t == 'op':
         if ast[0].v == '=':
-            if isinstance(ast[1], List):
-                raise Exception('Parse Err: cannot assign value to expression')
-            if ast[1].t != 'ident':
-                raise Exception('Parse Err: cannot assign to rvalue')
+            assert(isinstance(ast[1], List))
+            if len(ast[1]) != 1:
+                raise NotImplementedError('Cannot assign value to list')
+            if isinstance(ast[1][0], List):
+                raise Exception('Parse error: cannot assign to expression')
+            if ast[1][0].t != 'ident':
+                raise Exception('Parse error: cannot assign to rvalue')
             (rir, renv) = generate_ir(ast[2], env, ret + 1)
-            return (rir + [('set', f'v{ast[1].v}', f'$r{ret+1}'),
+            return (rir + [('set', f'v{ast[1][0].v}', f'$r{ret+1}'),
                            ('set', f'r{ret}', f'$r{ret+1}')],
-                    (env[0], env[1] | renv[1] | {ast[1].v}))
+                    (env[0], env[1] | renv[1] | {ast[1][0].v}))
         elif ast[0].v == '->':
             assert(isinstance(ast[1], List))
             idents = [ident.v for ident in ast[1] if isinstance(ident, Token)]
@@ -379,15 +396,22 @@ def generate_bash(ir: IR) -> str:
 
 def zeusc(command: str, env: Env) -> Tuple[str, Env]:
     tokens: List[Token] = tokenize(command)
+    if SHOW_OPTIONS['tokens']:
+        print(tokens)
     ast: AST = parse(tokens)
+    if SHOW_OPTIONS['ast']:
+        print(ast)
     (ir, env) = generate_ir(ast, env, 0)
+    if SHOW_OPTIONS['ir']:
+        print(ir)
     # ir = optimize_ir(ir)
     bash = generate_bash(ir)
+    if SHOW_OPTIONS['sh']:
+        print(bash)
     return (str(bash), env)
 
 def zeus(command: str, env: Env, process) -> Tuple[str, str, Env]:
     (bash, env) = zeusc(command, env)
-    # print(bash)
     # debug # return (bash + str(env), '', 0, env)
     process.stdin.write(bash)
     process.stdin.flush()
@@ -416,6 +440,15 @@ def main() -> int:
     while True:
         try:
             command = input('>> ') 
+            options = command.strip().split()
+            if len(options) == 2 and options[0] == 'show':
+                global SHOW_OPTIONS
+                if options[1] not in SHOW_OPTIONS:
+                    print(f'Option \'{options[1]}\' does not exist')
+                    continue
+                SHOW_OPTIONS[options[1]] = not SHOW_OPTIONS[options[1]]
+                print(f'Set \'{options[1]}\' to {SHOW_OPTIONS[options[1]]}')
+                continue
             (output, error, env) = zeus(command, env, process)
             if output: print(output, end='')
             if error: print(f'Error: {error}')
