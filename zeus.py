@@ -26,19 +26,31 @@ CombFn = Callable[[CombData], CombData]
 
 # TODO: The consistency with boxing is fucking stupid here, change that shit
 
+def compose(f: CombFn, g: CombFn) -> CombFn:
+    def composition(cd: CombData) -> CombData:
+        return g(f(cd))
+    return composition
+
 class Combinator:
-    fn: CombFn
-    def __init__(self, fn: CombFn):
-        self.fn = fn
+    fns: List[CombFn]
+    def __init__(self, fns: CombFn | List[CombFn]):
+        if isinstance(fns, List):
+            self.fns = fns
+        else:
+            self.fns = [fns]
 
     def __call__(self, cd: CombData) -> CombData:
-        return self.fn(cd)
+        res = cd
+        for fn in self.fns:
+            res = fn(res)
+        return res
 
     def then(self, other: Combinator) -> Combinator:
-        def then_fn(cd: CombData) -> CombData:
-            return other(self(cd))
-        return Combinator(then_fn)
-    
+        return Combinator([compose(f, g) for f in self.fns for g in other.fns])
+
+    def compose(self, other: CombFn) -> Combinator:
+        return self.then(Combinator(other))
+
     def then_cat(self, other: Combinator) -> Combinator:
         return self.then(other).cat()
 
@@ -59,13 +71,7 @@ class Combinator:
         return Combinator(cat_fn)
 
     def alt(self, other: Combinator) -> Combinator:
-        def alt_fn(cd: CombData) -> CombData:
-            res = self(cd)
-            if res:
-                return res
-            else:
-                return other(cd)
-        return Combinator(alt_fn)
+        return Combinator([self, other])
 
     def any_cat(self) -> Combinator:
         def any_cat_fn(cd: CombData) -> CombData:
@@ -82,17 +88,20 @@ class Combinator:
             return last if not cd else cd
         return Combinator(any_cat_fn)
 
+    # this is not properly any anymore, and needs to be fixed, but i don't know
+    # how yet
     def any(self) -> Combinator:
-        def any_fn(cd: CombData) -> CombData:
-            last = cd
-            cd = self(cd)
-            if not cd: return None
-            while cd and cd[0]:
-                last = cd
-                cd = self(cd)
-            return last if not cd else cd
-        return Combinator(any_fn)
-
+        return cid().then_opt(
+                self.then_opt(
+                self.then_opt(
+                self.then_opt(
+                self.then_opt(
+                self.then_opt(
+                self.then_opt(
+                self.then_opt(
+                self.then_opt(
+                self.then_opt(self))))))))))
+        
     def discard(self) -> Combinator:
         def discard_fn(cd: CombData) -> CombData:
             res = self(cd)
@@ -102,12 +111,12 @@ class Combinator:
 
     def convert(self, fn: Callable[[OutType], OutBase]) -> Combinator:
         def convert_fn(cd: CombData) -> CombData:
-            res = self(cd)
-            if not res: return None
-            appl = fn(res[1][-1])
+            if not cd: return None
+            if not cd[1]: return cd
+            appl = fn(cd[1][-1])
             if not appl: return None
-            return (res[0], res[1][0:-1] + [appl])
-        return Combinator(convert_fn)
+            return (cd[0], cd[1][0:-1] + [appl])
+        return self.then(Combinator(convert_fn))
 
     def cond(self, fn: Callable[[OutType], bool]) -> Combinator:
         return self.convert(lambda x: x if fn(x) else None)
@@ -140,6 +149,10 @@ class Combinator:
             print(cd)
             return self(cd)
         return Combinator(display_fn)
+
+    def complete(self) -> Combinator:
+        return self.compose(lambda cd: cd if cd and not cd[0] else None)
+
 
 def cid() -> Combinator:
     def cid_fn(cd: CombData) -> CombData:
@@ -225,6 +238,11 @@ def tokenize(s: str) -> List[Token]:
                  .box()
                  .convert(stringify)
                  .convert(lambda xs: Token('ident', str(xs))))
+            .alt(cset(list(map(list, sorted(['(', ')'],
+                                            key=len, reverse=True))))
+                 .box()
+                 .convert(stringify)
+                 .convert(lambda xs: Token('sep', str(xs))))
             .any()
             )((list(s), []))
     return res[1] if res else []
@@ -236,6 +254,8 @@ OP_PREC = {
         }
 
 def precedes(x, y) -> bool:
+    if isinstance(x[0], List) or isinstance(y[0], List):
+        return True
     if x[0].t != 'op' or y[0].t != 'op':
         return True
     if x[0].v not in OP_PREC:
@@ -247,9 +267,17 @@ def precedes(x, y) -> bool:
 def pol_order(xs: List) -> List:
     return [xs[1], xs[0], xs[2]]
 
+"""
+opexpr = expr op expr
+expr = (expr) | rval | opexpr | callexpr 
+"""
+
 def parse_opexpr() -> Combinator:
-    return (
-            ctype(['val', 'ident']).box()
+    return (cid().apply(parse_subexpr)
+            .then_cat(ctype(['op']))
+            .then_cat(cid().apply(parse_subexpr))
+            .convert(pol_order))
+    return (ctype(['val', 'ident']).box()
             .then_cat(ctype(['op']))
             .apply(parse_expr)
             .convert(pol_order)
@@ -267,29 +295,41 @@ def parse_opexpr() -> Combinator:
             .cat())
 
 def parse_fnexpr() -> Combinator:
-    return (
-            ctype(['ident']).any_cat().box()
+    return (ctype(['ident']).any_cat().box()
             .then_cat(cterm([Token('op', '->')]))
-            .apply(parse_expr)
+            .apply(parse_subexpr)
             .convert(pol_order)
             .box()
             .cat())
 
 def parse_callexpr() -> Combinator:
-    return (
-            ctype(['ident']).box()
+    return (ctype(['ident']).box()
             .then_cat(ctype(['ident', 'val']).any_cat().box())
             .convert(lambda xs: [Token('call', None), *xs]))
 
+def parse_parenexpr() -> Combinator:
+    return (cterm([Token('sep', '(')]).discard()
+            .apply(parse_subexpr)
+            .then_cat(cterm([Token('sep', ')')]).discard()))
+
+def parse_subexpr() -> Combinator:
+    return (ctype(['val', 'ident']).box()
+            .alt(parse_parenexpr())
+            .alt(parse_opexpr())
+            .alt(parse_fnexpr())
+            .alt(parse_callexpr()))
+
 def parse_expr() -> Combinator:
-    return (parse_fnexpr()
-            .alt(parse_callexpr())
-            .alt(parse_opexpr()))
+    return (ctype(['val', 'ident']).box().complete()
+            .alt(parse_parenexpr().complete())
+            .alt(parse_opexpr().complete())
+            .alt(parse_fnexpr().complete())
+            .alt(parse_callexpr().complete()))
 
 AST = Token | List['AST']
 
 def parse(tokens: List[Token]) -> AST:
-    res = parse_expr().any()((tokens, []))
+    res = parse_expr()((tokens, []))
     if not res:
         return []
     elif isinstance(res[1], List):
