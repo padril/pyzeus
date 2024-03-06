@@ -144,224 +144,17 @@ def parse_daphne(s: str) -> Optional[AST[str]]:
           a tuple, and `discard` which returns an empty tuple
      - removal of "alternates" used by standard EBNF
      - removal of {} and [] for repetition and optionality, respectively
-
-    Definition (minus all the correct functions):
-
-    ```
-    visible_ascii = "!" ... "~" ;
-    whitespace    = " " | "\n" | "\t" | "\r" | "\f" | "\b" ;
-    character     = visible_ascii | whitespace ;
-    letter        = "A" ... "Z" | "a" ... "z" ;
-    digit         = "0" ... "9" ;
-
-    S { discard } = whitespace * ;
-
-    quantifier = "+" | "*" | "?" | "!" ;
-    identifier = letter 
-               | letter , ( letter | digit | "_" | " " ) * ,
-                 ( letter | digit | "_" ) ;
-
-    single_terminal = "'" , ( character - "'" ) + , "'"
-                    | '"' , ( character - '"' ) + , '"' ;
-    range_terminal  = single_terminal , S , "..." , S , single_terminal ;
-    terminal        = single_terminal | range_terminal
-
-    term { wrap } = "(" , S , rhs , S , ")" | terminal | identifier ;
-
-    factor_expression { wrap } = term , S , quantifier
-                               | term , S , "-" , S , term
-    factor = factor_expression | term
-
-    concatenation { wrap } = factor , ( S, "," , S , factor ) * ;
-    alternation = concatenation , ( S, "|" , S , concatenation ) * ;
-
-    block { wrap } = "{" , ( character - ( "{" | "}" ) | block ) * , "}" ;
-
-    rhs { wrap } = alternation ;
-    lhs { wrap } = identifier , ( S , block ) ?;
-
-    rule { wrap } = lhs , S , "=" , S , rhs , S , ";" ;
-
-    grammar = ( S , rule , S ) * ;
+    
+    Definition in `cf.daphne`
     ```
 
     >>> parse_daphne('expr {concat} = ( "(", expr, ")" | "a" ... "z" ) * ;')
     (('RULE', ('NAME', ('IDENT', 'expr')), ('FUNC', ('BLOCK', 'concat')), ('ANY', ('ALT', ('SEQ', ('TERM', '('), ('IDENT', 'expr'), ('TERM', ')')), ('RANGE', ('TERM', 'a'), ('TERM', 'z'))))),)
     """
 
-    visible_ascii_fs = tuple(Terminal(c) for c in map(chr, range(33, 127)))
-    visible_ascii = NonTerminal(Alternation(visible_ascii_fs))
-
-    whitespace_fs = tuple(Terminal(c) for c in ' \n\t\r\f\b')
-    whitespace = NonTerminal(Alternation(whitespace_fs))
-
-    character_fs = visible_ascii_fs + whitespace_fs
-    character = NonTerminal(Alternation(character_fs))
-
-    letter_fs = tuple(Terminal(c) for c in ASCII_LETTERS)
-    letter = NonTerminal(Alternation(letter_fs))
-
-    digit_fs = tuple(Terminal(c) for c in ASCII_DIGITS)
-    digit = NonTerminal(Alternation(digit_fs))
-
-    S_fs = ((Alternation(whitespace_fs), 'S'), Empty())
-    S = NonTerminal(Alternation(S_fs), discard)
-
-    quantifier_fs = tuple(Terminal(c) for c in '*+?')
-    quantifier = NonTerminal(Alternation(quantifier_fs))
-
-    _ident_star = NonTerminal(Alternation((
-        (Alternation((letter_fs + digit_fs + (Terminal('_'), Terminal(' ')))),
-         '_ident_star'), Empty())))
-    identifier = NonTerminal(
-            Alternation((
-                Alternation(letter_fs), (
-                    Alternation(letter_fs), '_ident_star',
-                    Alternation(letter_fs + digit_fs + (Terminal('_'),))))),
-                lambda xs: (('IDENT', *concat(xs)),))
-
-    _non_single_quote_star = NonTerminal(
-            Alternation((
-                (Alternation(
-                    tuple(el for el in character_fs
-                          if el != Terminal("'"))),
-                 '_non_single_quote_star'),
-                (Terminal('\\'), Anything(), '_non_single_quote_star'),
-                Empty())))
-    _non_double_quote_star = NonTerminal(
-            Alternation((
-                (Alternation(
-                    tuple(el for el in character_fs
-                          if el != Terminal('"'))),
-                 '_non_double_quote_star'),
-                (Terminal('\\'), Anything(), '_non_double_quote_star'),
-                Empty())))
-    
-    single_terminal = NonTerminal(
-            Alternation(
-                ((Terminal("'"), '_non_single_quote_star', Terminal("'")),
-                 (Terminal('"'), '_non_double_quote_star', Terminal('"')))),
-                lambda xs: (('TERM', *convert_escaped(concat(xs[1:-1])[0])),))
-
-    range_terminal = NonTerminal(('single_terminal', 'S',
-                                  tuple(Terminal(c) for c in '...'), 'S',
-                                  'single_terminal'),
-                                 lambda xs: (('RANGE', xs[0], xs[-1]),))
-
-    cut = NonTerminal(Terminal('!'), lambda _: (('CUT',),))
-    
-    terminal = NonTerminal(Alternation(('single_terminal', 'range_terminal',
-                                        'cut')))
-
-    _paren_term = NonTerminal((Terminal('('), 'S', 'rhs', 'S', Terminal(')')),
-                              lambda xs: xs[1:-1])
-    term_fs = Alternation(('_paren_term', 'terminal', 'identifier'))
-    term = NonTerminal(term_fs)
-
-    QUANT_MAP = {
-            '*': 'ANY',
-            '+': 'MANY',
-            '?': 'OPT',
-            }
-    _quantified_expression = NonTerminal(
-            ('term', 'S', 'quantifier'),
-            lambda xs: (QUANT_MAP[xs[1]], xs[0]) if isinstance(xs[1],
-                                                               str) else xs)
-
-    _difference_expression = NonTerminal(
-            ('term', 'S', Terminal('-'), 'S', 'term'),
-            lambda xs: ('DIFF', xs[0], xs[2]))
-
-    factor_expression_fs = Alternation(
-            ('_quantified_expression',
-             '_difference_expression'))
-    factor_expression = NonTerminal(factor_expression_fs, wrap)
-
-    factor = NonTerminal(Alternation(('factor_expression', 'term')))
-
-    _concatenation_star = NonTerminal(
-            Alternation((('S', Terminal(','), 'S', 'factor',
-                        '_concatenation_star'), Empty())),
-            lambda xs: (xs[1], *(xs[2:])) if len(xs) > 1 else tuple())
-    concatenation = NonTerminal(('factor', '_concatenation_star'),
-                                lambda xs: (('SEQ', *xs),)
-                                if len(xs) > 1 else xs)
-
-    _alternation_star = NonTerminal(
-            Alternation((('S', Terminal('|'), 'S', 'concatenation',
-                        '_alternation_star'), Empty())),
-            lambda xs: (xs[1], *(xs[2:])) if len(xs) > 1 else tuple())
-    alternation = NonTerminal(('concatenation', '_alternation_star'),
-                              lambda xs: (('ALT', *xs),)
-                              if len(xs) > 1 else xs)
-
-    _block_star = NonTerminal(
-            Alternation((
-                (Alternation(
-                    tuple(el for el in character_fs
-                          if el not in {Terminal('{'), Terminal('}')}) + \
-                                  ('block',)),
-                 '_block_star'),
-                Empty())))
-    block = NonTerminal((Terminal('{'), '_block_star', Terminal('}')))
-
-    outer_block = NonTerminal('block',
-                        lambda xs: (('BLOCK', concat(xs[1:-1])[0]),))
-
-    rhs = NonTerminal('alternation')
-
-    lhs = NonTerminal(Alternation(('identifier', ('identifier', 'S', 'outer_block'))),
-                      lambda xs: (('NAME', xs[0]), ('FUNC', *(xs[1:]))))
-
-    rule = NonTerminal(('S', 'lhs', 'S', Terminal('='), 'S', 'rhs', 'S',
-                        Terminal(';'), Cut(), 'S'),
-                       lambda xs: (('RULE', xs[0], xs[1], xs[3]),))
-
-    grammar = NonTerminal(Alternation((('rule', 'grammar'), Empty())))
-
-    ctx = {
-            'visible_ascii_fs': visible_ascii_fs,
-            'visible_ascii': visible_ascii,
-            'whitespace_fs': whitespace_fs,
-            'whitespace': whitespace,
-            'character_fs': character_fs,
-            'character': character,
-            'letter_fs': letter_fs,
-            'letter': letter,
-            'digit_fs': digit_fs,
-            'digit': digit,
-            'S_fs': S_fs,
-            'S': S,
-            'quantifier_fs': quantifier_fs,
-            'quantifier': quantifier,
-            '_ident_star': _ident_star,
-            'identifier': identifier,
-            '_non_single_quote_star': _non_single_quote_star,
-            '_non_double_quote_star': _non_double_quote_star,
-            'single_terminal': single_terminal,
-            'range_terminal': range_terminal,
-            'cut': cut,
-            'terminal': terminal,
-            '_paren_term': _paren_term,
-            'term_fs': term_fs,
-            'term': term,
-            '_quantified_expression': _quantified_expression,
-            '_difference_expression': _difference_expression,
-            'factor_expression_fs': factor_expression_fs,
-            'factor_expression': factor_expression,
-            'factor': factor,
-            '_concatenation_star': _concatenation_star,
-            'concatenation': concatenation,
-            '_alternation_star': _alternation_star,
-            'alternation': alternation,
-            '_block_star': _block_star,
-            'block': block,
-            'outer_block': outer_block,
-            'rhs': rhs,
-            'lhs': lhs,
-            'rule': rule,
-            'grammar': grammar,
-            }
+    ctx = {}
+    with open('compiled.txt', 'r') as f:
+        ctx = compile_ast(eval(f.read()))
 
     grammar = find(ctx, s, 'grammar')
     
@@ -473,7 +266,7 @@ def compile_ast[T](grammar: AST[str]) -> Context[T]:
     return context
 
 def selfhost(filename: str) -> None:
-    with open(filename, 'r') as f, open('compiled.txt', 'w') as compiled:
+    with open(filename, 'r') as f, open('compiled_new.txt', 'w') as compiled:
         s = f.read()
         daphne = parse_daphne(s)
         print(daphne, file=compiled)
